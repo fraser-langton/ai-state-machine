@@ -26,14 +26,14 @@
     "DEPLOYED": ["PLAN", "DEV"]
   },
   "triggers": [
-    { "on": "prompt", "match": "^\\s*[/$]([a-z0-9-]+:)?(code-review|codex-review|my-review|review)\\b", "to": "IN REVIEW" },
-    { "on": "skill", "match": "^([a-z0-9-]+:)?(code-review|codex-review|my-review|review)$", "to": "IN REVIEW" },
-    { "on": "prompt", "match": "^\\s*[/$]([a-z0-9-]+:)?merge-when-ready\\b", "to": "MERGING" },
-    { "on": "skill", "match": "^([a-z0-9-]+:)?merge-when-ready$", "to": "MERGING" },
-    { "on": "command", "match": "(^|[;&|(\\s])gh pr create\\b.*\\s(--draft|-d)\\b", "to": "DRAFT PR" },
-    { "on": "command", "match": "(^|[;&|(\\s])gh pr create\\b", "to": "PR READY" },
-    { "on": "command", "match": "(^|[;&|(\\s])gh pr ready\\b", "unless": "gh pr ready[^;&|]*--undo", "to": "PR READY" },
-    { "on": "command", "match": "(^|[;&|(\\s])gh pr merge\\b", "unless": "gh pr merge[^;&|]*--(auto|disable-auto)\\b", "to": "MERGED" },
-    { "on": "command", "match": "(^|[;&|(\\s])git (-C \\S+ )?commit\\b", "from": ["REVIEW DONE"], "to": "READY FOR REVIEW" }
+    { "label": "/code-review, /codex-review, /my-review", "on": "prompt", "match": "^\\s*[/$]([a-z0-9-]+:)?(code-review|codex-review|my-review|review)\\b", "to": "IN REVIEW" },
+    { "label": "/code-review, /codex-review, /my-review", "on": "skill", "match": "^([a-z0-9-]+:)?(code-review|codex-review|my-review|review)$", "to": "IN REVIEW" },
+    { "label": "/merge-when-ready", "on": "prompt", "match": "^\\s*[/$]([a-z0-9-]+:)?merge-when-ready\\b", "to": "MERGING" },
+    { "label": "/merge-when-ready", "on": "skill", "match": "^([a-z0-9-]+:)?merge-when-ready$", "to": "MERGING" },
+    { "label": "gh pr create --draft", "on": "command", "match": "(^|[;&|(\\s])gh pr create\\b.*\\s(--draft|-d)\\b", "to": "DRAFT PR" },
+    { "label": "gh pr create", "on": "command", "match": "(^|[;&|(\\s])gh pr create\\b", "to": "PR READY" },
+    { "label": "gh pr ready", "on": "command", "match": "(^|[;&|(\\s])gh pr ready\\b", "unless": "gh pr ready[^;&|]*--undo", "to": "PR READY" },
+    { "label": "gh pr merge", "on": "command", "match": "(^|[;&|(\\s])gh pr merge\\b", "unless": "gh pr merge[^;&|]*--(auto|disable-auto)\\b", "to": "MERGED" },
+    { "label": "git commit", "on": "command", "match": "(^|[;&|(\\s])git (-C \\S+ )?commit\\b", "from": ["REVIEW DONE"], "to": "READY FOR REVIEW" }
   ]
 }

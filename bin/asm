@@ -1,7 +1,9 @@
 #!/bin/bash
 # asm — ai-state-machine: track where an AI coding session is in your workflow.
 #
-# State machine:  $ASM_HOME/machine.json (falls back to machine.default.json)
+# State machine:  the nearest .ai-state-machine/machine.json walking up from the current
+#                 folder (so a repo can define its own), else $ASM_HOME/machine.json, else the
+#                 bundled machine.default.json. $ASM_MACHINE overrides all of them.
 # History:        $ASM_HOME/state.db, an append-only SQLite log of every transition.
 #                 Nothing is deleted; `asm reset` appends a reset row.
 #
@@ -14,6 +16,9 @@
 #   asm statusline                              run the wrapped status line, then add the progress line
 #   asm hook                                    hook entry point for Claude Code and Codex (event JSON on stdin)
 #   asm validate                                check machine.json
+#   asm diagram                                 print machine.json as a Mermaid state diagram
+#   asm which                                   print which machine.json applies here
+#   asm init                                    give this repo its own machine (copy of the current one)
 #
 # Session: --session ID, else $ASM_SESSION_ID, $CLAUDE_CODE_SESSION_ID, $CODEX_THREAD_ID,
 # else the session_id in JSON on stdin (render, statusline, hook).
@@ -25,13 +30,21 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 
 die() { echo "asm: $*" >&2; exit 1; }
 
+# Which machine applies in the current folder: $ASM_MACHINE, else the nearest
+# .ai-state-machine/machine.json walking up (repo first, like skills), else the user's
+# $ASM_HOME/machine.json, else the bundled default. Pure bash: called on every render.
 machine_file() {
-  local f
-  for f in "${ASM_MACHINE:-}" "$ASM_HOME/machine.json" "$ASM_HOME/machine.default.json" \
-           "$(dirname "$SELF")/../machine.default.json"; do
-    [ -n "$f" ] && [ -f "$f" ] && { echo "$f"; return; }
+  local f d=$PWD
+  [ -n "${ASM_MACHINE:-}" ] && [ -f "$ASM_MACHINE" ] && { echo "$ASM_MACHINE"; return; }
+  while [ -n "$d" ]; do
+    [ -f "$d/.ai-state-machine/machine.json" ] && { echo "$d/.ai-state-machine/machine.json"; return; }
+    [ "$d" = / ] && break
+    d=${d%/*}; d=${d:-/}
   done
-  die "no machine.json found (looked in $ASM_HOME)"
+  for f in "$ASM_HOME/machine.json" "$ASM_HOME/machine.default.json" "$(dirname "$SELF")/../machine.default.json"; do
+    [ -f "$f" ] && { echo "$f"; return; }
+  done
+  die "no machine.json found"
 }
 
 sql_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
@@ -173,8 +186,46 @@ cmd_log() {
       FROM transitions $where ORDER BY id DESC LIMIT $((limit))) ORDER BY id;"
 }
 
+# Mermaid stateDiagram of the machine: allowed transitions as edges, edges a trigger can take
+# labelled "auto · <label>", and each state filled with its status line colour.
+cmd_diagram() {
+  jq -r '
+    def hx: . as $n | "0123456789abcdef" as $d | $d[($n / 16 | floor):($n / 16 | floor) + 1] + $d[($n % 16):($n % 16) + 1];
+    def rgb: if . < 16 then ["000000","800000","008000","808000","000080","800080","008080","c0c0c0",
+                             "808080","ff0000","00ff00","ffff00","0000ff","ff00ff","00ffff","ffffff"][.]
+      elif . < 232 then (. - 16) as $i | [0, 95, 135, 175, 215, 255] as $l
+        | ($l[$i / 36 | floor] | hx) + ($l[($i / 6 | floor) % 6] | hx) + ($l[$i % 6] | hx)
+      else (8 + (. - 232) * 10 | hx) as $g | $g + $g + $g end;
+    def id: gsub("[^A-Za-z0-9]"; "_");
+    . as $m
+    | ($m.triggers // []) as $tr
+    | def labels($from; $to): [$tr[] | select(.to == $to and .label != null
+        and ((.from // null) == null or (.from | index($from)) != null)) | .label] | unique | join(", ");
+    "stateDiagram-v2",
+    ($m.states[] | "    state \"\(.name)\" as \(.name | id)"),
+    "    [*] --> \($m.states[0].name | id)",
+    (($m.transitions // {}) | to_entries[] | .key as $f | .value[] as $t
+      | labels($f; $t) as $l
+      | "    \($f | id) --> \($t | id)" + (if $l == "" then "" else " : auto · \($l)" end)),
+    ($m.states[] | "    classDef c_\(.name | id) fill:#\((.color // 244) | rgb),stroke:#333,color:#111",
+                   "    class \(.name | id) c_\(.name | id)")
+  ' "$(machine_file)"
+}
+
+cmd_which() { machine_file; }
+
+cmd_init() {
+  local top dest src
+  top=$(git rev-parse --show-toplevel 2>/dev/null) || top=$PWD
+  dest="$top/.ai-state-machine/machine.json"
+  [ -f "$dest" ] && die "$dest already exists"
+  src=$(machine_file)
+  mkdir -p "${dest%/*}" && cp "$src" "$dest"
+  echo "created $dest (copied from $src). Edit it, then run: asm validate"
+}
+
 cmd_validate() {
-  local f; f=$(machine_file)
+  local f=${1:-}; [ -n "$f" ] || f=$(machine_file)
   jq -e '
     [.states[].name] as $n |
     (.states | type == "array" and length > 0)
@@ -189,8 +240,13 @@ cmd_validate() {
 
 # Progress line: current highlighted, visited ✓, skipped ✗ (a later state was reached), rest dim.
 cmd_render() {
-  if [ -z "$SESSION" ] && [ ! -t 0 ]; then
-    SESSION=$(jq -r '.session_id // empty' 2>/dev/null)
+  if [ ! -t 0 ]; then
+    # Status line JSON: session, and the folder whose machine applies.
+    local sid dir
+    { IFS= read -r -d '' sid; IFS= read -r -d '' dir; } < <(jq -j '
+      [(.session_id // ""), (.workspace.current_dir // .cwd // "")] | map(tostring + "\u0000") | add' 2>/dev/null)
+    [ -z "$SESSION" ] && SESSION=$sid
+    [ -n "$dir" ] && [ -d "$dir" ] && cd "$dir"
   fi
   resolve_session
   [ -n "$SESSION" ] || return 0
@@ -303,7 +359,10 @@ case "$sub" in
   render) cmd_render ;;
   statusline) cmd_statusline ;;
   hook) cmd_hook ;;
-  validate) cmd_validate ;;
+  validate) cmd_validate "$@" ;;
+  which) cmd_which ;;
+  init) cmd_init ;;
+  diagram) cmd_diagram ;;
   -h|--help|help) sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$sub' (try asm help)" ;;
 esac

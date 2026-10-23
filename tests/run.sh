@@ -5,6 +5,7 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 export ASM_HOME; ASM_HOME=$(mktemp -d)
 export ASM_SESSION_ID=t1 ASM_HARNESS=test
 unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID ASM_MACHINE
+cd "$ASM_HOME"   # outside $HOME, so no real .ai-state-machine/machine.json is found walking up
 fail=0
 asm() { timeout 60 "$here/bin/asm" "$@" </dev/null; }
 hook() { printf '%s' "$1" | timeout 60 "$here/bin/asm" hook; }
@@ -53,5 +54,27 @@ expect "statusline wraps existing" "WRAPPED" "$out"
 ctx=$(printf '{"session_id":"t1","hook_event_name":"SessionStart"}' | timeout 60 "$here/bin/asm" hook | jq -r .hookSpecificOutput.additionalContext | head -1)
 expect "SessionStart context" "ai-state-machine tracks this session's workflow stage (machine: dev-workflow). Current stage: PR READY." "$ctx"
 
-rm -rf "$ASM_HOME"
+# Per-repo machines: the nearest .ai-state-machine/machine.json wins over the user's.
+repo="$ASM_HOME/repo"; mkdir -p "$repo/.ai-state-machine" "$repo/src/deep"
+cat > "$repo/.ai-state-machine/machine.json" <<'JSON'
+{ "name": "tickets",
+  "states": [ {"name": "TODO", "color": 244}, {"name": "DOING", "color": 39}, {"name": "DONE", "color": 82} ],
+  "transitions": { "TODO": ["DOING"], "DOING": ["DONE"] },
+  "triggers": [ {"label": "git commit", "on": "command", "match": "git commit", "to": "DONE"} ] }
+JSON
+( cd "$repo/src/deep"
+  expect "which finds repo machine" "$repo/src/deep/../../.ai-state-machine/machine.json" "$(asm which | sed "s#^$repo#$repo/src/deep/../..#")"
+  export ASM_SESSION_ID=t2
+  expect "set from a repo subfolder" "(none) -> DOING" "$(asm set doing)"
+  asm set todo >/dev/null 2>&1; expect "repo machine enforces its own transitions" "1" "$?"
+)
+expect "user/default machine used outside the repo" "$here/bin/../machine.default.json" "$(asm which)"
+line=$(printf '{"session_id":"t2","workspace":{"current_dir":"%s"}}' "$repo" | timeout 60 "$here/bin/asm" render | sed 's/\x1b\[[0-9;]*m//g')
+expect "status line uses the session folder's machine" " DOING  › DONE" "${line#*› }"
+expect "machine name recorded" "tickets" "$(sqlite3 "$ASM_HOME/state.db" "select machine from transitions where session_id = 't2' order by id desc limit 1")"
+expect "diagram edge with trigger label" "    DOING --> DONE : auto · git commit" "$(cd "$repo" && asm diagram | grep 'DOING --> DONE')"
+mkdir -p "$ASM_HOME/other" && (cd "$ASM_HOME/other" && git init -q && asm init >/dev/null)
+expect "init gives a repo its own machine" "1" "$([ -f "$ASM_HOME/other/.ai-state-machine/machine.json" ] && echo 1)"
+
+cd /; rm -rf "$ASM_HOME"
 [ "$fail" = 0 ] && echo "all passed" || { echo "FAILED"; exit 1; }

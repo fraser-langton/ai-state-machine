@@ -31,7 +31,7 @@ Every transition is stored permanently, so you can see how work actually flows.
 ## How it works
 
 - **`~/.ai-state-machine/`** is the one central home for every harness:
-  - `machine.json` is your state machine
+  - `machine.json` is your user-wide state machine (repos can have their own)
   - `state.db` is the transition history
   - `bin/asm` is the CLI
 - **History is append-only SQLite.** Each row records time, session, harness, cwd, repo and branch, from-state, to-state, what caused it and whether the move was allowed. `asm reset` appends a reset row; nothing is ever deleted.
@@ -64,42 +64,140 @@ bash ai-state-machine/scripts/install.sh            # sets up Claude Code and Co
 bash ai-state-machine/scripts/install.sh --uninstall  # undo; your machine.json and history are kept
 ```
 
+## The default machine
+
+A plan → build → local review → PR → merge → deploy workflow. Edges are the allowed transitions. An edge labelled `auto ·` is one a hook takes for you when you run that command or skill. Each state is filled with its status line colour. This diagram is generated from [`machine.default.json`](machine.default.json) by `asm diagram`.
+
+```mermaid
+stateDiagram-v2
+    state "PLAN" as PLAN
+    state "DEV" as DEV
+    state "READY FOR REVIEW" as READY_FOR_REVIEW
+    state "IN REVIEW" as IN_REVIEW
+    state "REVIEW DONE" as REVIEW_DONE
+    state "DRAFT PR" as DRAFT_PR
+    state "PR READY" as PR_READY
+    state "MERGING" as MERGING
+    state "MERGED" as MERGED
+    state "DEPLOYED" as DEPLOYED
+    [*] --> PLAN
+    PLAN --> DEV
+    DEV --> PLAN
+    DEV --> READY_FOR_REVIEW
+    READY_FOR_REVIEW --> DEV
+    READY_FOR_REVIEW --> IN_REVIEW : auto · /code-review, /codex-review, /my-review
+    IN_REVIEW --> DEV
+    IN_REVIEW --> READY_FOR_REVIEW
+    IN_REVIEW --> REVIEW_DONE
+    REVIEW_DONE --> READY_FOR_REVIEW : auto · git commit
+    REVIEW_DONE --> DRAFT_PR : auto · gh pr create --draft
+    REVIEW_DONE --> PR_READY : auto · gh pr create, gh pr ready
+    DRAFT_PR --> DEV
+    DRAFT_PR --> READY_FOR_REVIEW
+    DRAFT_PR --> IN_REVIEW : auto · /code-review, /codex-review, /my-review
+    DRAFT_PR --> PR_READY : auto · gh pr create, gh pr ready
+    PR_READY --> DEV
+    PR_READY --> READY_FOR_REVIEW
+    PR_READY --> IN_REVIEW : auto · /code-review, /codex-review, /my-review
+    PR_READY --> DRAFT_PR : auto · gh pr create --draft
+    PR_READY --> MERGING : auto · /merge-when-ready
+    MERGING --> DEV
+    MERGING --> READY_FOR_REVIEW
+    MERGING --> PR_READY : auto · gh pr create, gh pr ready
+    MERGING --> MERGED : auto · gh pr merge
+    MERGED --> DEV
+    MERGED --> DEPLOYED
+    DEPLOYED --> PLAN
+    DEPLOYED --> DEV
+    classDef c_PLAN fill:#af87ff,stroke:#333,color:#111
+    class PLAN c_PLAN
+    classDef c_DEV fill:#00afff,stroke:#333,color:#111
+    class DEV c_DEV
+    classDef c_READY_FOR_REVIEW fill:#ffd700,stroke:#333,color:#111
+    class READY_FOR_REVIEW c_READY_FOR_REVIEW
+    classDef c_IN_REVIEW fill:#ff8700,stroke:#333,color:#111
+    class IN_REVIEW c_IN_REVIEW
+    classDef c_REVIEW_DONE fill:#5fff00,stroke:#333,color:#111
+    class REVIEW_DONE c_REVIEW_DONE
+    classDef c_DRAFT_PR fill:#bcbcbc,stroke:#333,color:#111
+    class DRAFT_PR c_DRAFT_PR
+    classDef c_PR_READY fill:#00ff00,stroke:#333,color:#111
+    class PR_READY c_PR_READY
+    classDef c_MERGING fill:#d7af87,stroke:#333,color:#111
+    class MERGING c_MERGING
+    classDef c_MERGED fill:#ff87ff,stroke:#333,color:#111
+    class MERGED c_MERGED
+    classDef c_DEPLOYED fill:#00ffff,stroke:#333,color:#111
+    class DEPLOYED c_DEPLOYED
+```
+
 ## Customise the state machine
 
-Edit `~/.ai-state-machine/machine.json`, then run `asm validate`. The default is a plan → build → local review → PR → merge → deploy workflow:
+A machine is one JSON file. `asm` picks one the way skills do, so a repo can carry its own workflow:
 
-```jsonc
+1. `$ASM_MACHINE`, if set
+2. the nearest `.ai-state-machine/machine.json`, walking up from the current folder, so a repo's own machine wins
+3. `~/.ai-state-machine/machine.json`, your user-wide machine
+4. the bundled default
+
+The status line and hooks resolve it from the session's folder, so each session follows its repo's workflow. Every transition records the machine's `name`, so history stays separable.
+
+```sh
+asm init       # give this repo its own machine: copies the one in effect to <repo>/.ai-state-machine/machine.json
+asm which      # which machine applies here
+asm validate   # check it
+asm diagram    # draw it as Mermaid; paste into any .md, as below
+```
+
+Commit `.ai-state-machine/machine.json` to share a repo's workflow with your team.
+
+### Example: a three-state machine
+
+```json
 {
-  "name": "dev-workflow",
+  "name": "review-only",
   "states": [
-    { "name": "PLAN", "color": 141, "description": "Designing or planning, no code yet." },
-    { "name": "DEV", "color": 39, "description": "Building, including UAT checks, hands-on review and writing tests." }
-    // … in display order; color is a 256-colour ANSI code
+    { "name": "BUILD", "color": 39, "description": "Writing the change." },
+    { "name": "REVIEW", "color": 208, "description": "Local review running or being addressed." },
+    { "name": "SHIP", "color": 46, "description": "Merged." }
   ],
   "transitions": {
-    "PLAN": ["DEV"],
-    "DEV": ["PLAN", "READY FOR REVIEW"]
-    // omit "transitions" entirely to allow any move
+    "BUILD": ["REVIEW"],
+    "REVIEW": ["BUILD", "SHIP"]
   },
   "triggers": [
-    { "on": "prompt",  "match": "^\\s*[/$]([a-z0-9-]+:)?(code-review|codex-review|my-review|review)\\b", "to": "IN REVIEW" },
-    { "on": "skill",   "match": "^([a-z0-9-]+:)?merge-when-ready$", "to": "MERGING" },
-    { "on": "command", "match": "(^|[;&|(\\s])gh pr merge\\b", "unless": "--(auto|disable-auto)\\b", "to": "MERGED" },
-    { "on": "command", "match": "(^|[;&|(\\s])git commit\\b", "from": ["REVIEW DONE"], "to": "READY FOR REVIEW" }
+    { "label": "/code-review", "on": "prompt", "match": "^\\s*/code-review\\b", "to": "REVIEW" },
+    { "label": "git commit", "on": "command", "match": "\\bgit commit\\b", "from": ["REVIEW"], "to": "BUILD" },
+    { "label": "gh pr merge", "on": "command", "match": "\\bgh pr merge\\b", "to": "SHIP" }
   ]
 }
 ```
 
-- **States** are listed in display order. `description` is what the agent is told each state means.
-- **Transitions** map each state to the states it may move to.
-  - `asm set` refuses any other move unless you pass `--force`, which records the move with `allowed = 0`.
-  - Triggers always record what happened, even when the move isn't listed, and flag it the same way.
-- **Triggers** fire on:
-  - `prompt`: what the user typed
-  - `skill`: a skill the agent invoked
-  - `command`: a shell command the agent ran
+`asm diagram` draws it as:
 
-  `match` and `unless` are regexes, and `from` limits a trigger to certain current states. The first matching trigger wins.
+```mermaid
+stateDiagram-v2
+    state "BUILD" as BUILD
+    state "REVIEW" as REVIEW
+    state "SHIP" as SHIP
+    [*] --> BUILD
+    BUILD --> REVIEW : auto · /code-review
+    REVIEW --> BUILD : auto · git commit
+    REVIEW --> SHIP : auto · gh pr merge
+    classDef c_BUILD fill:#00afff,stroke:#333,color:#111
+    class BUILD c_BUILD
+    classDef c_REVIEW fill:#ff8700,stroke:#333,color:#111
+    class REVIEW c_REVIEW
+    classDef c_SHIP fill:#00ff00,stroke:#333,color:#111
+    class SHIP c_SHIP
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Recorded on every transition, so you can tell workflows apart in the history. |
+| `states[]` | Display order. `color` is a 256-colour ANSI code, and `description` is what the agent is told the state means. |
+| `transitions` | Each state's allowed next states. `asm set` refuses anything else unless you pass `--force`, and records that move with `allowed = 0`. Leave `transitions` out to allow any move. |
+| `triggers[]` | Automatic moves, first match wins. `on` is `prompt` (what the user typed), `skill` (a skill the agent called) or `command` (a shell command the agent ran). `match` and `unless` are regexes. `from` limits it to certain current states, and `label` names the edge in the diagram. A trigger always records what happened; if the move isn't an allowed transition it's flagged `allowed = 0`. |
 
 ## CLI
 
@@ -110,6 +208,7 @@ asm states                                  states, allowed next states and desc
 asm log [--all] [--limit N]                 history for this session, or every session
 asm reset [--reason TEXT]                   start this session's progress over
 asm validate                                check machine.json
+asm which | init | diagram                  see "Customise the state machine"
 ```
 
 The session comes from `--session`, else `$ASM_SESSION_ID`, `$CLAUDE_CODE_SESSION_ID` or `$CODEX_THREAD_ID`. In Claude Code, `/ai-state-machine:state [STATE|log|states|reset]` does the same.
@@ -128,7 +227,7 @@ sqlite3 ~/.ai-state-machine/state.db "
 | Variable | Effect |
 | --- | --- |
 | `ASM_HOME` | Central home. Default `~/.ai-state-machine`. |
-| `ASM_MACHINE` | Use a different machine file, for example per project. |
+| `ASM_MACHINE` | Use this machine file everywhere, ignoring repo and user machines. |
 | `ASM_SESSION_ID` | Override the session ID. |
 
 ## Tests
