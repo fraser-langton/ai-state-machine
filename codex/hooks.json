@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "bash \"$HOME/.ai-state-machine/bin/asm\" hook", "timeout": 10 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "bash \"$HOME/.ai-state-machine/bin/asm\" hook", "timeout": 10 } ] }
+    ],
+    "PostToolUse": [
+      { "hooks": [ { "type": "command", "command": "bash \"$HOME/.ai-state-machine/bin/asm\" hook", "timeout": 10 } ] }
+    ]
+  }
+}

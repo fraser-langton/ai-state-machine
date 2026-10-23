@@ -1,0 +1,39 @@
+{
+  "name": "dev-workflow",
+  "description": "Plan, build, review locally, open a PR, merge and deploy.",
+  "states": [
+    { "name": "PLAN", "color": 141, "description": "Designing or planning, no code yet." },
+    { "name": "DEV", "color": 39, "description": "Building, including UAT checks, hands-on review and writing tests." },
+    { "name": "READY FOR REVIEW", "color": 220, "description": "Development and tests done, waiting for a local review (/code-review, /codex-review, /my-review)." },
+    { "name": "IN REVIEW", "color": 208, "description": "A review is running, or its findings are being fixed." },
+    { "name": "REVIEW DONE", "color": 82, "description": "The review is clean on the current head." },
+    { "name": "DRAFT PR", "color": 250, "description": "A draft PR is open." },
+    { "name": "PR READY", "color": 46, "description": "The PR is marked ready." },
+    { "name": "MERGING", "color": 180, "description": "/merge-when-ready is running: waiting for checks or fixing blockers before it merges." },
+    { "name": "MERGED", "color": 213, "description": "Merged; the prod deploy is running." },
+    { "name": "DEPLOYED", "color": 51, "description": "Deploy finished and prod is verified." }
+  ],
+  "transitions": {
+    "PLAN": ["DEV"],
+    "DEV": ["PLAN", "READY FOR REVIEW"],
+    "READY FOR REVIEW": ["DEV", "IN REVIEW"],
+    "IN REVIEW": ["DEV", "READY FOR REVIEW", "REVIEW DONE"],
+    "REVIEW DONE": ["READY FOR REVIEW", "DRAFT PR", "PR READY"],
+    "DRAFT PR": ["DEV", "READY FOR REVIEW", "IN REVIEW", "PR READY"],
+    "PR READY": ["DEV", "READY FOR REVIEW", "IN REVIEW", "DRAFT PR", "MERGING"],
+    "MERGING": ["DEV", "READY FOR REVIEW", "PR READY", "MERGED"],
+    "MERGED": ["DEV", "DEPLOYED"],
+    "DEPLOYED": ["PLAN", "DEV"]
+  },
+  "triggers": [
+    { "on": "prompt", "match": "^\\s*[/$]([a-z0-9-]+:)?(code-review|codex-review|my-review|review)\\b", "to": "IN REVIEW" },
+    { "on": "skill", "match": "^([a-z0-9-]+:)?(code-review|codex-review|my-review|review)$", "to": "IN REVIEW" },
+    { "on": "prompt", "match": "^\\s*[/$]([a-z0-9-]+:)?merge-when-ready\\b", "to": "MERGING" },
+    { "on": "skill", "match": "^([a-z0-9-]+:)?merge-when-ready$", "to": "MERGING" },
+    { "on": "command", "match": "(^|[;&|(\\s])gh pr create\\b.*\\s(--draft|-d)\\b", "to": "DRAFT PR" },
+    { "on": "command", "match": "(^|[;&|(\\s])gh pr create\\b", "to": "PR READY" },
+    { "on": "command", "match": "(^|[;&|(\\s])gh pr ready\\b", "unless": "gh pr ready[^;&|]*--undo", "to": "PR READY" },
+    { "on": "command", "match": "(^|[;&|(\\s])gh pr merge\\b", "unless": "gh pr merge[^;&|]*--(auto|disable-auto)\\b", "to": "MERGED" },
+    { "on": "command", "match": "(^|[;&|(\\s])git (-C \\S+ )?commit\\b", "from": ["REVIEW DONE"], "to": "READY FOR REVIEW" }
+  ]
+}

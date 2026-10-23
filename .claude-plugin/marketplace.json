@@ -1,0 +1,12 @@
+{
+  "name": "ai-state-machine",
+  "description": "Customisable workflow state machine for AI coding sessions.",
+  "owner": { "name": "Fraser Langton" },
+  "plugins": [
+    {
+      "name": "ai-state-machine",
+      "source": "./",
+      "description": "Workflow state machine with a status line progress row, automatic transitions and SQLite history."
+    }
+  ]
+}

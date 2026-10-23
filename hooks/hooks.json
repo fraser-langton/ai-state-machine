@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/asm\" hook", "timeout": 10 } ] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/asm\" hook", "timeout": 10 } ] }
+    ],
+    "PostToolUse": [
+      { "matcher": "Bash|Skill", "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/bin/asm\" hook", "timeout": 10 } ] }
+    ]
+  }
+}
