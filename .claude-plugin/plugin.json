@@ -1,6 +1,6 @@
 {
   "name": "ai-state-machine",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Track where an AI coding session is in your workflow with a customisable state machine: a progress line in the status line, hooks that move state automatically, and a permanent SQLite history.",
   "author": { "name": "Fraser Langton" },
   "homepage": "https://github.com/fraser-langton/ai-state-machine",

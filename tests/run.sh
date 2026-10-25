@@ -39,13 +39,31 @@ expect "codex-style array command merge" "MERGED" "$(asm get)"
 line=$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" render | sed 's/\x1b\[[0-9;]*m//g')
 expect "render" "✓ PLAN › ✓ DEV › ✓ READY FOR REVIEW › ✓ IN REVIEW › ✓ REVIEW DONE › ✓ DRAFT PR › ✓ PR READY › ✓ MERGING ›  MERGED  › DEPLOYED" "$line"
 
+# Cursor: camelCase events, Shell tool, command in tool_input.
+cur_ev() { printf '{"session_id":"t1","hook_event_name":"%s",%s}' "$1" "$2"; }
+asm set "pr ready" --force >/dev/null
+hook "$(cur_ev beforeSubmitPrompt '"prompt":"/merge-when-ready 7"')"; expect "cursor beforeSubmitPrompt" "MERGING" "$(asm get)"
+ASM_HARNESS= hook "$(cur_ev postToolUse '"tool_name":"Shell","tool_input":{"command":"gh pr merge 7 --squash"}')"; expect "cursor postToolUse Shell" "MERGED" "$(asm get)"
+expect "cursor harness recorded" "cursor" "$(sqlite3 "$ASM_HOME/state.db" "select harness from transitions order by id desc limit 1")"
+ctx=$(printf '{"session_id":"t1","hook_event_name":"sessionStart"}' | timeout 60 "$here/bin/asm" hook | jq -r '.additional_context' | head -1)
+expect "cursor sessionStart context" "ai-state-machine tracks this session's workflow stage (machine: dev-workflow). Current stage: MERGED." "$ctx"
+
+# Hooks that don't fire, and the progress line, start no programs: run them with an empty PATH.
+nopath() { PATH=/var/empty /bin/bash "$here/bin/asm" "$@"; }
+out=$(printf '%s' "$(bash_ev 'ls -la')" | nopath hook 2>&1; echo "rc=$?")
+expect "non-firing hook needs no programs" "rc=0" "$out"
+out=$(printf '%s' "$(ev UserPromptSubmit '"prompt":"hello"')" | nopath hook 2>&1; echo "rc=$?")
+expect "plain prompt needs no programs" "rc=0" "$out"
+out=$(printf '{"session_id":"t1"}' | nopath render 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | head -c 8)
+expect "render needs no programs" "✓ PLAN" "$out"
+
 asm reset --reason "new task" >/dev/null; expect "reset" "(none)" "$(asm get)"
 expect "render empty after reset" "" "$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" render)"
 asm set plan >/dev/null; asm set dev --force >/dev/null; asm set "pr ready" --force >/dev/null
 line=$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" render | sed 's/\x1b\[[0-9;]*m//g')
 expect "skipped stages marked" "✓ PLAN › ✓ DEV › ✗ READY FOR REVIEW › ✗ IN REVIEW › ✗ REVIEW DONE › ✗ DRAFT PR ›  PR READY  › MERGING › MERGED › DEPLOYED" "$line"
-expect "history kept" "16" "$(sqlite3 "$ASM_HOME/state.db" 'select count(*) from transitions')"
-expect "forced move flagged" "1" "$(sqlite3 "$ASM_HOME/state.db" "select count(*) from transitions where allowed = 0")"
+expect "history kept" "19" "$(sqlite3 "$ASM_HOME/state.db" 'select count(*) from transitions')"
+expect "forced moves flagged" "2" "$(sqlite3 "$ASM_HOME/state.db" "select count(*) from transitions where allowed = 0")"
 
 echo 'printf "WRAPPED"' > "$ASM_HOME/wrapped-statusline"
 out=$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" statusline | sed 's/\x1b\[[0-9;]*m//g' | head -1)

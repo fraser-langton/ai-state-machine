@@ -13,127 +13,236 @@
 #   asm log [--all] [--limit N]                 show transitions (this session, or all)
 #   asm reset [--reason TEXT]                   start this session's progress over
 #   asm render                                  print the progress line (status line JSON on stdin optional)
-#   asm statusline                              run the wrapped status line, then add the progress line
-#   asm hook                                    hook entry point for Claude Code and Codex (event JSON on stdin)
-#   asm validate                                check machine.json
-#   asm diagram                                 print machine.json as a Mermaid state diagram
+#   asm statusline [HARNESS]                    run the wrapped status line, then add the progress line
+#   asm hook                                    hook entry point for Claude Code, Codex and Cursor
+#   asm validate [FILE]                         check a machine file
+#   asm diagram                                 print the machine as a Mermaid state diagram
 #   asm which                                   print which machine.json applies here
 #   asm init                                    give this repo its own machine (copy of the current one)
 #
 # Session: --session ID, else $ASM_SESSION_ID, $CLAUDE_CODE_SESSION_ID, $CODEX_THREAD_ID,
 # else the session_id in JSON on stdin (render, statusline, hook).
-set -uo pipefail
+#
+# Speed: hooks and the status line run on every prompt, tool call and redraw, and endpoint
+# security scans every program started. So those paths use bash builtins only. The machine
+# is compiled to a sourceable cache when its JSON changes (jq, rarely), the session's path
+# is cached in a small file, and sqlite3 runs only when a transition is recorded.
 
 ASM_HOME="${ASM_HOME:-$HOME/.ai-state-machine}"
 DB="$ASM_HOME/state.db"
-SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+case "${BASH_SOURCE[0]}" in
+  */*) SELF_DIR=${BASH_SOURCE[0]%/*} ;;
+  *) SELF_DIR=. ;;
+esac
+[ "${SELF_DIR#/}" = "$SELF_DIR" ] && SELF_DIR="$PWD/$SELF_DIR"
+SELF="$SELF_DIR/asm"
 
 die() { echo "asm: $*" >&2; exit 1; }
 
+# ---------------------------------------------------------------- machine
+
 # Which machine applies in the current folder: $ASM_MACHINE, else the nearest
 # .ai-state-machine/machine.json walking up (repo first, like skills), else the user's
-# $ASM_HOME/machine.json, else the bundled default. Pure bash: called on every render.
+# $ASM_HOME/machine.json, else the bundled default. Sets REPLY.
 machine_file() {
   local f d=$PWD
-  [ -n "${ASM_MACHINE:-}" ] && [ -f "$ASM_MACHINE" ] && { echo "$ASM_MACHINE"; return; }
+  REPLY=""
+  if [ -n "${ASM_MACHINE:-}" ] && [ -f "$ASM_MACHINE" ]; then REPLY=$ASM_MACHINE; return; fi
   while [ -n "$d" ]; do
-    [ -f "$d/.ai-state-machine/machine.json" ] && { echo "$d/.ai-state-machine/machine.json"; return; }
+    if [ -f "$d/.ai-state-machine/machine.json" ]; then REPLY="$d/.ai-state-machine/machine.json"; return; fi
     [ "$d" = / ] && break
     d=${d%/*}; d=${d:-/}
   done
-  for f in "$ASM_HOME/machine.json" "$ASM_HOME/machine.default.json" "$(dirname "$SELF")/../machine.default.json"; do
-    [ -f "$f" ] && { echo "$f"; return; }
+  for f in "$ASM_HOME/machine.json" "$ASM_HOME/machine.default.json" "$SELF_DIR/../machine.default.json"; do
+    if [ -f "$f" ]; then REPLY=$f; return; fi
   done
-  die "no machine.json found"
 }
 
-sql_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"; }
-
-db() {
-  mkdir -p "$ASM_HOME"
-  sqlite3 -batch -cmd ".timeout 2000" "$DB" "$@"
-}
-
-db_init() {
-  [ -f "$DB" ] && return
-  db >/dev/null <<'SQL'
-PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS transitions (
-  id         INTEGER PRIMARY KEY,
-  at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-  session_id TEXT NOT NULL,
-  harness    TEXT,
-  cwd        TEXT,
-  repo       TEXT,
-  branch     TEXT,
-  machine    TEXT,
-  from_state TEXT,
-  to_state   TEXT NOT NULL,              -- '' marks a reset
-  source     TEXT NOT NULL,              -- manual | trigger:<n> | reset
-  detail     TEXT,                       -- reason, or what fired the trigger
-  allowed    INTEGER NOT NULL DEFAULT 1  -- 0 when the move is not in transitions
-);
-CREATE INDEX IF NOT EXISTS transitions_session ON transitions (session_id, id);
-SQL
-}
-
-harness() {
-  if [ -n "${ASM_HARNESS:-}" ]; then echo "$ASM_HARNESS"
-  elif [ -n "${CLAUDE_CODE_SESSION_ID:-}${CLAUDECODE:-}" ]; then echo claude
-  elif [ -n "${CODEX_THREAD_ID:-}" ]; then echo codex
-  else echo unknown; fi
-}
-
-# States reached since the session's last reset, oldest first, one per line.
-session_path() {
-  [ -f "$DB" ] || return 0
-  local s; s=$(sql_quote "$1")
-  db "SELECT to_state FROM transitions
-      WHERE session_id = $s
-        AND id > (SELECT COALESCE(MAX(id), 0) FROM transitions WHERE session_id = $s AND to_state = '')
-      ORDER BY id;"
-}
-
-current_state() { session_path "$1" | tail -n1; }
-
-# Record a move. Args: session from to source detail allowed machine
-record() {
-  local sid=$1 from=$2 to=$3 source=$4 detail=$5 allowed=$6 machine=$7 repo="" branch="" g
-  if g=$(git rev-parse --show-toplevel --abbrev-ref HEAD 2>/dev/null); then
-    repo=$(basename "${g%%$'\n'*}"); branch=${g#*$'\n'}
+# Load the machine for the current folder into M_* and T_* arrays, compiling its cache
+# with jq only when the JSON is newer than the cache.
+load_machine() {
+  machine_file
+  [ -n "$REPLY" ] || die "no machine.json found"
+  M_FILE=$REPLY
+  local key=${M_FILE//\//%}
+  local cache="$ASM_HOME/cache/$key.sh"
+  if [ ! -f "$cache" ] || [ "$M_FILE" -nt "$cache" ]; then
+    command -v jq >/dev/null || die "needs jq to compile $M_FILE"
+    [ -d "$ASM_HOME/cache" ] || mkdir -p "$ASM_HOME/cache"
+    jq -r '
+      def arr($n; f): "\($n)=(\([.[] | f | tostring | @sh] | join(" ")))";
+      "M_NAME=\(.name // "default" | @sh)",
+      "M_HAS_TRANS=\(if .transitions == null then 0 else 1 end)",
+      (.states | arr("M_STATES"; .name), arr("M_COLORS"; .color // 244), arr("M_DESCS"; .description // "")),
+      ((.transitions // {}) | to_entries | arr("M_TFROM"; .key), arr("M_TTO"; "|" + (.value | join("|")) + "|")),
+      ((.triggers // []) | arr("T_ON"; .on), arr("T_MATCH"; .match), arr("T_UNLESS"; .unless // ""),
+        arr("T_FROM"; if .from == null then "" else "|" + (.from | join("|")) + "|" end),
+        arr("T_TO"; .to), arr("T_LABEL"; .label // ""))
+    ' "$M_FILE" > "$cache.tmp.$$" 2>/dev/null && mv "$cache.tmp.$$" "$cache" \
+      || { rm -f "$cache.tmp.$$"; die "can't read $M_FILE (run asm validate)"; }
   fi
-  db "INSERT INTO transitions (session_id, harness, cwd, repo, branch, machine, from_state, to_state, source, detail, allowed)
-      VALUES ($(sql_quote "$sid"), $(sql_quote "$(harness)"), $(sql_quote "$PWD"), $(sql_quote "$repo"),
-              $(sql_quote "$branch"), $(sql_quote "$machine"), $(sql_quote "$from"), $(sql_quote "$to"),
-              $(sql_quote "$source"), $(sql_quote "$detail"), $allowed);"
+  . "$cache"
 }
 
-# jq helpers shared by set and hook: is from -> to allowed (no transitions table,
-# no current state, same state, or listed).
-JQ_ALLOWED='def allowed($from; $to): if (.transitions == null) or ($from == "") or ($from == $to)
-  or (((.transitions[$from] // []) | index($to)) != null) then 1 else 0 end;'
-
-# One jq call for `set`: prints canonical state, allowed flag, machine name, allowed list,
-# all states (tab separated). Canonical is empty for an unknown state.
-plan_move() {
-  jq -r --arg cur "$1" --arg w "$2" "$JQ_ALLOWED"'
-    def norm: ascii_upcase | gsub("[-_\\s]+"; " ") | ltrimstr(" ") | rtrimstr(" ");
-    (($w | norm) as $want | [.states[].name | select(norm == $want)] | first // "") as $to
-    | [$to, (if $to == "" then 0 else allowed($cur; $to) end), (.name // ""),
-       ((.transitions[$cur] // []) | join(", ")), ([.states[].name] | join(", "))] | @tsv' "$(machine_file)"
+# REPLY = index of state $1 in M_STATES, or -1.
+state_index() {
+  local i
+  REPLY=-1
+  for ((i = 0; i < ${#M_STATES[@]}; i++)); do
+    [ "${M_STATES[i]}" = "$1" ] && { REPLY=$i; return; }
+  done
 }
+
+# REPLY = 1 if $1 -> $2 is allowed (no transitions table, no current state, same state, or listed).
+allowed() {
+  local i
+  REPLY=1
+  [ "$M_HAS_TRANS" = 0 ] || [ -z "$1" ] || [ "$1" = "$2" ] && return
+  for ((i = 0; i < ${#M_TFROM[@]}; i++)); do
+    if [ "${M_TFROM[i]}" = "$1" ]; then
+      case "${M_TTO[i]}" in *"|$2|"*) return ;; esac
+    fi
+  done
+  REPLY=0
+}
+
+# REPLY = allowed next states from $1, comma separated.
+nexts() {
+  local i v
+  REPLY=""
+  for ((i = 0; i < ${#M_TFROM[@]}; i++)); do
+    if [ "${M_TFROM[i]}" = "$1" ]; then v=${M_TTO[i]#|}; v=${v%|}; REPLY=${v//|/, }; return; fi
+  done
+}
+
+# ---------------------------------------------------------------- session state
 
 SESSION=""
 resolve_session() {
   [ -n "$SESSION" ] && return
   SESSION="${ASM_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-}}}"
 }
-need_session() { resolve_session; [ -n "$SESSION" ] || die "no session id: pass --session, or run inside Claude Code or Codex"; }
+need_session() { resolve_session; [ -n "$SESSION" ] || die "no session id: pass --session, or run inside Claude Code, Codex or Cursor"; }
+
+# The session's path since its last reset (one state per line) is cached here; SQLite is the history.
+session_file() { REPLY="$ASM_HOME/sessions/${1//\//_}"; }
+
+# Sets PATH_STATES (array, oldest first) and CUR for session $1.
+read_path() {
+  local line
+  PATH_STATES=(); CUR=""
+  session_file "$1"
+  [ -f "$REPLY" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] && PATH_STATES+=("$line")
+  done < "$REPLY"
+  [ ${#PATH_STATES[@]} -gt 0 ] && CUR=${PATH_STATES[${#PATH_STATES[@]} - 1]}
+}
+
+harness() {
+  if [ -n "${ASM_HARNESS:-}" ]; then REPLY=$ASM_HARNESS
+  elif [ -n "${CLAUDE_CODE_SESSION_ID:-}${CLAUDECODE:-}" ]; then REPLY=claude
+  elif [ -n "${CODEX_THREAD_ID:-}" ]; then REPLY=codex
+  elif [ -n "${CURSOR_AGENT:-}${CURSOR_CLI:-}" ]; then REPLY=cursor
+  else REPLY=unknown; fi
+}
+
+# Repo and branch for the current folder from .git files, without running git.
+git_info() {
+  local d=$PWD gitdir="" line top=""
+  GIT_REPO=""; GIT_BRANCH=""
+  while [ -n "$d" ]; do
+    if [ -d "$d/.git" ]; then gitdir="$d/.git"; top=$d; break; fi
+    if [ -f "$d/.git" ]; then
+      IFS= read -r line < "$d/.git"; gitdir=${line#gitdir: }; top=$d
+      [ "${gitdir#/}" = "$gitdir" ] && gitdir="$d/$gitdir"
+      break
+    fi
+    [ "$d" = / ] && break
+    d=${d%/*}; d=${d:-/}
+  done
+  [ -n "$gitdir" ] || return 0
+  case "$gitdir" in
+    */.git/worktrees/*) top=${gitdir%/.git/worktrees/*} ;;  # a worktree: name the main repo
+  esac
+  GIT_REPO=${top##*/}
+  if [ -f "$gitdir/HEAD" ]; then
+    IFS= read -r line < "$gitdir/HEAD"
+    case "$line" in "ref: refs/heads/"*) GIT_BRANCH=${line#ref: refs/heads/} ;; *) GIT_BRANCH=HEAD ;; esac
+  fi
+}
+
+q() { REPLY="'${1//\'/\'\'}'"; }
+
+# Record a move in SQLite and the session cache. Args: session from to source detail allowed
+# (machine name from the loaded machine). The only path that starts a program (sqlite3).
+record() {
+  local sid=$1 from=$2 to=$3 source=$4 detail=$5 ok=$6 v sql
+  [ -d "$ASM_HOME/sessions" ] || mkdir -p "$ASM_HOME/sessions"
+  session_file "$sid"
+  if [ -z "$to" ]; then : > "$REPLY"; else printf '%s\n' "$to" >> "$REPLY"; fi
+  git_info; harness; local h=$REPLY
+  sql="PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS transitions (
+  id INTEGER PRIMARY KEY,
+  at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  session_id TEXT NOT NULL, harness TEXT, cwd TEXT, repo TEXT, branch TEXT, machine TEXT,
+  from_state TEXT,
+  to_state TEXT NOT NULL,               -- '' marks a reset
+  source TEXT NOT NULL,                 -- manual | trigger:<n> | reset | import
+  detail TEXT,                          -- reason, or what fired the trigger
+  allowed INTEGER NOT NULL DEFAULT 1    -- 0 when the move is not in transitions
+);
+CREATE INDEX IF NOT EXISTS transitions_session ON transitions (session_id, id);
+INSERT INTO transitions (session_id, harness, cwd, repo, branch, machine, from_state, to_state, source, detail, allowed) VALUES ("
+  for v in "$sid" "$h" "$PWD" "$GIT_REPO" "$GIT_BRANCH" "$M_NAME" "$from" "$to" "$source" "$detail"; do
+    q "$v"; sql+="$REPLY, "
+  done
+  sql+="$ok);"
+  sqlite3 -batch -cmd ".timeout 3000" "$DB" "$sql" >/dev/null
+}
+
+# ---------------------------------------------------------------- JSON on stdin, builtins only
+
+INPUT=""
+read_input() { [ -t 0 ] || IFS= read -r -d '' INPUT; INPUT=${INPUT%%,\"tool_response\":*}; }
+
+# json_str KEY: REPLY = first "KEY":"..." string in INPUT, unescaped (\uXXXX left as is).
+BS='\'
+json_str() {
+  local re="\"$1\"[[:space:]]*:[[:space:]]*\"((\\\\.|[^\"\\\\])*)\"" v=""
+  if [[ $INPUT =~ $re ]]; then
+    v=${BASH_REMATCH[1]}
+    v=${v//"$BS$BS"/$'\001'}
+    v=${v//"${BS}n"/$'\n'}
+    v=${v//"${BS}t"/$'\t'}
+    v=${v//"${BS}r"/$'\r'}
+    v=${v//"$BS\""/\"}
+    v=${v//"$BS/"/\/}
+    v=${v//$'\001'/$BS}
+  fi
+  REPLY=$v
+}
+
+# json_strs KEY: REPLY = first "KEY":[...] string array in INPUT, joined with spaces (Codex commands).
+json_strs() {
+  local re="\"$1\"[[:space:]]*:[[:space:]]*\\[([^]]*)\\]" v=""
+  if [[ $INPUT =~ $re ]]; then
+    v=${BASH_REMATCH[1]}; v=${v//\",\"/ }; v=${v//\", \"/ }; v=${v#\"}; v=${v%\"}
+  fi
+  REPLY=$v
+}
+
+json_escape() {
+  local v=$1
+  v=${v//$BS/$BS$BS}; v=${v//\"/$BS\"}; v=${v//$'\n'/${BS}n}; v=${v//$'\t'/${BS}t}; v=${v//$'\r'/}
+  REPLY=$v
+}
 
 # ---------------------------------------------------------------- commands
 
 cmd_set() {
-  local want="" force=0 reason=""
+  local want="" force=0 reason="" w i to=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --force) force=1 ;;
@@ -143,43 +252,56 @@ cmd_set() {
     shift
   done
   [ -n "$want" ] || die "usage: asm set <STATE> [--force] [--reason TEXT]"
-  need_session; db_init
-  local cur to allowed machine nexts all
-  cur=$(current_state "$SESSION")
-  IFS=$'\t' read -r to allowed machine nexts all < <(plan_move "$cur" "$want")
-  [ -n "$to" ] || die "unknown state '$want'. States: $all"
-  if [ "$cur" = "$to" ]; then echo "$to (unchanged)"; return; fi
-  if [ "$allowed" = 0 ] && [ "$force" = 0 ]; then
-    die "$cur -> $to is not an allowed transition. Allowed from $cur: ${nexts:-none}. Use --force to record it anyway."
+  need_session; load_machine; read_path "$SESSION"
+  w=${want//[-_]/ }
+  shopt -s nocasematch
+  for ((i = 0; i < ${#M_STATES[@]}; i++)); do
+    [[ "${M_STATES[i]}" == "$w" ]] && { to=${M_STATES[i]}; break; }
+  done
+  shopt -u nocasematch
+  if [ -z "$to" ]; then
+    local all=""; for ((i = 0; i < ${#M_STATES[@]}; i++)); do all+="${all:+, }${M_STATES[i]}"; done
+    die "unknown state '$want'. States: $all"
   fi
-  record "$SESSION" "$cur" "$to" manual "$reason" "$allowed" "$machine"
-  echo "${cur:-(none)} -> $to"
+  if [ "$CUR" = "$to" ]; then echo "$to (unchanged)"; return; fi
+  allowed "$CUR" "$to"; local ok=$REPLY
+  if [ "$ok" = 0 ] && [ "$force" = 0 ]; then
+    nexts "$CUR"
+    die "$CUR -> $to is not an allowed transition. Allowed from $CUR: ${REPLY:-none}. Use --force to record it anyway."
+  fi
+  record "$SESSION" "$CUR" "$to" manual "$reason" "$ok"
+  echo "${CUR:-(none)} -> $to"
 }
 
-cmd_get() { need_session; local c; c=$(current_state "$SESSION"); echo "${c:-(none)}"; }
+cmd_get() { need_session; read_path "$SESSION"; echo "${CUR:-(none)}"; }
 
 cmd_reset() {
   local reason=""
   [ "${1:-}" = "--reason" ] && reason=${2:-}
-  need_session; db_init
-  record "$SESSION" "$(current_state "$SESSION")" "" reset "$reason" 1 "$(jq -r '.name // ""' "$(machine_file)")"
+  need_session; load_machine; read_path "$SESSION"
+  record "$SESSION" "$CUR" "" reset "$reason" 1
   echo "reset"
 }
 
 cmd_states() {
-  jq -r '.states[] as $s | "\($s.name)\t-> \((.transitions[$s.name] // ["any"]) | join(", "))\n\t\($s.description // "")"' "$(machine_file)"
+  local i
+  load_machine
+  for ((i = 0; i < ${#M_STATES[@]}; i++)); do
+    nexts "${M_STATES[i]}"
+    [ "$M_HAS_TRANS" = 0 ] && REPLY=any
+    printf '%s\t-> %s\n\t%s\n' "${M_STATES[i]}" "${REPLY:-none}" "${M_DESCS[i]}"
+  done
 }
 
 cmd_log() {
-  local all=0 limit=50
+  local all=0 limit=50 where=""
   while [ $# -gt 0 ]; do
     case "$1" in --all) all=1 ;; --limit) limit=${2:-50}; shift ;; esac
     shift
   done
   [ -f "$DB" ] || { echo "(no history)"; return; }
-  local where=""
-  if [ "$all" = 0 ]; then need_session; where="WHERE session_id = $(sql_quote "$SESSION")"; fi
-  db -header -column "SELECT * FROM (SELECT id, at, substr(session_id, 1, 8) AS session, harness, repo,
+  if [ "$all" = 0 ]; then need_session; q "$SESSION"; where="WHERE session_id = $REPLY"; fi
+  sqlite3 -batch -header -column "$DB" "SELECT * FROM (SELECT id, at, substr(session_id, 1, 8) AS session, harness, repo,
         COALESCE(NULLIF(from_state, ''), '-') AS from_state,
         CASE to_state WHEN '' THEN '(reset)' ELSE to_state END AS to_state,
         source, CASE allowed WHEN 1 THEN '' ELSE 'forced' END AS flag, detail
@@ -189,6 +311,7 @@ cmd_log() {
 # Mermaid stateDiagram of the machine: allowed transitions as edges, edges a trigger can take
 # labelled "auto · <label>", and each state filled with its status line colour.
 cmd_diagram() {
+  machine_file
   jq -r '
     def hx: . as $n | "0123456789abcdef" as $d | $d[($n / 16 | floor):($n / 16 | floor) + 1] + $d[($n % 16):($n % 16) + 1];
     def rgb: if . < 16 then ["000000","800000","008000","808000","000080","800080","008080","c0c0c0",
@@ -209,23 +332,24 @@ cmd_diagram() {
       | "    \($f | id) --> \($t | id)" + (if $l == "" then "" else " : auto · \($l)" end)),
     ($m.states[] | "    classDef c_\(.name | id) fill:#\((.color // 244) | rgb),stroke:#333,color:#111",
                    "    class \(.name | id) c_\(.name | id)")
-  ' "$(machine_file)"
+  ' "$REPLY"
 }
 
-cmd_which() { machine_file; }
+cmd_which() { machine_file; echo "$REPLY"; }
 
 cmd_init() {
   local top dest src
   top=$(git rev-parse --show-toplevel 2>/dev/null) || top=$PWD
   dest="$top/.ai-state-machine/machine.json"
   [ -f "$dest" ] && die "$dest already exists"
-  src=$(machine_file)
+  machine_file; src=$REPLY
   mkdir -p "${dest%/*}" && cp "$src" "$dest"
   echo "created $dest (copied from $src). Edit it, then run: asm validate"
 }
 
 cmd_validate() {
-  local f=${1:-}; [ -n "$f" ] || f=$(machine_file)
+  local f=${1:-} i rc
+  if [ -z "$f" ]; then machine_file; f=$REPLY; fi
   jq -e '
     [.states[].name] as $n |
     (.states | type == "array" and length > 0)
@@ -235,109 +359,134 @@ cmd_validate() {
     and ((.triggers // []) | all(.to as $t | ($n | index($t)) != null
           and (.on | IN("prompt", "skill", "command")) and (.match | type == "string")))
   ' "$f" >/dev/null || die "$f is invalid: check state names are unique and every transition/trigger names a known state"
+  ASM_MACHINE=$f load_machine
+  for ((i = 0; i < ${#T_MATCH[@]}; i++)); do
+    [[ "" =~ ${T_MATCH[i]} ]]; rc=$?
+    [ "$rc" = 2 ] && die "$f: trigger $i match is not a valid POSIX extended regex: ${T_MATCH[i]}"
+    if [ -n "${T_UNLESS[i]}" ]; then
+      [[ "" =~ ${T_UNLESS[i]} ]]; rc=$?
+      [ "$rc" = 2 ] && die "$f: trigger $i unless is not a valid POSIX extended regex: ${T_UNLESS[i]}"
+    fi
+  done
   echo "ok: $f"
 }
 
 # Progress line: current highlighted, visited ✓, skipped ✗ (a later state was reached), rest dim.
+# Builtins only. Reads status line JSON on stdin for the session and folder, when given.
 cmd_render() {
-  if [ ! -t 0 ]; then
-    # Status line JSON: session, and the folder whose machine applies.
-    local sid dir
-    { IFS= read -r -d '' sid; IFS= read -r -d '' dir; } < <(jq -j '
-      [(.session_id // ""), (.workspace.current_dir // .cwd // "")] | map(tostring + "\u0000") | add' 2>/dev/null)
-    [ -z "$SESSION" ] && SESSION=$sid
-    [ -n "$dir" ] && [ -d "$dir" ] && cd "$dir"
+  read_input
+  if [ -n "$INPUT" ]; then
+    json_str session_id; [ -z "$SESSION" ] && SESSION=$REPLY
+    json_str current_dir; [ -z "$REPLY" ] && json_str cwd
+    [ -n "$REPLY" ] && [ -d "$REPLY" ] && cd "$REPLY"
   fi
   resolve_session
   [ -n "$SESSION" ] || return 0
-  local path cur
-  path=$(session_path "$SESSION")
-  cur=$(printf '%s\n' "$path" | tail -n1)
-  [ -n "$cur" ] || return 0
-  jq -rj --arg cur "$cur" --arg path "$path" '
-    def c($n; $t): "\u001b[38;5;\($n)m\($t)\u001b[0m";
-    ($path | split("\n") | map(select(. != ""))) as $seen |
-    [.states[].name] as $names |
-    ([$names | to_entries[] | select(.value as $v | $seen | index($v) != null) | .key] | max // -1) as $far |
-    [.states | to_entries[] | .key as $i | .value as $s |
-      if $s.name == $cur then "\u001b[1;7;38;5;\($s.color // 244)m \($s.name) \u001b[0m"
-      elif ($seen | index($s.name)) != null then c($s.color // 244; "✓ \($s.name)")
-      elif $i < $far then c(196; "✗ \($s.name)")
-      else c(240; $s.name) end
-    ] | join(c(240; " › "))
-  ' "$(machine_file)"
+  read_path "$SESSION"
+  [ -n "$CUR" ] || return 0
+  load_machine
+  local i j seen far=-1 out="" sep=$'\033[38;5;240m › \033[0m' name color
+  for ((i = 0; i < ${#M_STATES[@]}; i++)); do
+    for ((j = 0; j < ${#PATH_STATES[@]}; j++)); do
+      [ "${PATH_STATES[j]}" = "${M_STATES[i]}" ] && far=$i
+    done
+  done
+  for ((i = 0; i < ${#M_STATES[@]}; i++)); do
+    name=${M_STATES[i]}; color=${M_COLORS[i]}
+    seen=0
+    for ((j = 0; j < ${#PATH_STATES[@]}; j++)); do [ "${PATH_STATES[j]}" = "$name" ] && { seen=1; break; }; done
+    [ $i -gt 0 ] && out+=$sep
+    if [ "$name" = "$CUR" ]; then out+=$'\033[1;7;38;5;'"${color}m $name "$'\033[0m'
+    elif [ $seen = 1 ]; then out+=$'\033[38;5;'"${color}m✓ $name"$'\033[0m'
+    elif [ $i -lt $far ]; then out+=$'\033[38;5;196m✗ '"$name"$'\033[0m'
+    else out+=$'\033[38;5;240m'"$name"$'\033[0m'; fi
+  done
+  printf '%s' "$out"
 }
 
 # Status line: run the wrapped command (if any) with the same JSON, then add the progress line.
+# `asm statusline cursor` wraps the command in wrapped-statusline.cursor, so each harness
+# keeps its own; plain `asm statusline` (Claude Code) uses wrapped-statusline.
 cmd_statusline() {
-  local input wrapped="" out="" line
-  input=$(cat)
-  [ -f "$ASM_HOME/wrapped-statusline" ] && wrapped=$(cat "$ASM_HOME/wrapped-statusline")
-  [ -n "$wrapped" ] && out=$(printf '%s' "$input" | bash -c "$wrapped" 2>/dev/null)
-  line=$(printf '%s' "$input" | cmd_render)
+  local wrapped="" out="" line f="$ASM_HOME/wrapped-statusline"
+  [ -n "${1:-}" ] && f+=".$1"
+  read_input
+  [ -f "$f" ] && IFS= read -r wrapped < "$f"
+  [ -n "$wrapped" ] && out=$(printf '%s' "$INPUT" | bash -c "$wrapped" 2>/dev/null)
+  line=$(printf '%s' "$INPUT" | cmd_render)
   if [ -n "$out" ] && [ -n "$line" ]; then printf '%s\n%s' "$out" "$line"
   else printf '%s%s' "$out" "$line"; fi
 }
 
-# Hook: apply the first matching trigger; on SessionStart, tell the agent how to keep state.
+# Hook for Claude Code, Codex and Cursor: apply the first matching trigger; on session
+# start, tell the agent how to keep state. Builtins only unless a trigger fires.
 cmd_hook() {
-  local event sid cwd on text
-  # One jq call: event, session, cwd, trigger kind and text, NUL separated (text may hold newlines).
-  { IFS= read -r -d '' event; IFS= read -r -d '' sid; IFS= read -r -d '' cwd
-    IFS= read -r -d '' on; IFS= read -r -d '' text; } < <(jq -j '
-      def cmdtext: (.tool_input // {}) | (.command // .cmd // "") | if type == "array" then join(" ") else tostring end;
-      (.hook_event_name // "") as $e
-      | (if $e == "UserPromptSubmit" then ["prompt", (.prompt // "")]
-         elif $e == "PostToolUse" and .tool_name == "Skill" then ["skill", (.tool_input.skill // "")]
-         elif $e == "PostToolUse" then ["command", cmdtext]
-         else ["", ""] end) as $t
-      | [$e, (.session_id // ""), (.cwd // ""), $t[0], $t[1]] | map(tostring + "\u0000") | add' 2>/dev/null)
-  [ -n "$sid" ] || sid="${ASM_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-${CODEX_THREAD_ID:-}}}"
-  [ -n "$sid" ] || exit 0
-  SESSION=$sid
-  [ -n "$cwd" ] && [ -d "$cwd" ] && cd "$cwd"
+  local event on="" text="" i
+  read_input
+  json_str hook_event_name; event=$REPLY
+  json_str session_id; SESSION=$REPLY
+  [ -z "$SESSION" ] && { json_str conversation_id; SESSION=$REPLY; }
+  resolve_session
+  [ -n "$SESSION" ] || exit 0
+  case "$INPUT" in
+    *'"transcript_path"'*'/.codex/'*) ASM_HARNESS=${ASM_HARNESS:-codex} ;;
+    *'"transcript_path"'*'/.cursor/'*) ASM_HARNESS=${ASM_HARNESS:-cursor} ;;
+  esac
+  case "$event" in [a-z]*) ASM_HARNESS=${ASM_HARNESS:-cursor} ;; esac  # Cursor's events are camelCase
+  json_str cwd
+  if [ -z "$REPLY" ]; then json_strs workspace_roots; REPLY=${REPLY%% *}; fi
+  [ -n "$REPLY" ] && [ -d "$REPLY" ] && cd "$REPLY"
 
-  [ "$event" = SessionStart ] && { session_context; exit 0; }
-  [ -n "$on" ] && [ -n "$text" ] || exit 0
+  case "$event" in
+    SessionStart|sessionStart) session_context "$event"; exit 0 ;;
+    UserPromptSubmit|beforeSubmitPrompt) on=prompt; json_str prompt; text=$REPLY ;;
+    PostToolUse|postToolUse)
+      json_str tool_name
+      if [ "$REPLY" = Skill ]; then on=skill; json_str skill; text=$REPLY
+      else
+        on=command; json_str command; text=$REPLY
+        [ -z "$text" ] && { json_strs command; text=$REPLY; }
+        [ -z "$text" ] && { json_str cmd; text=$REPLY; }
+      fi ;;
+    *) exit 0 ;;
+  esac
+  [ -n "$text" ] || exit 0
 
-  db_init
-  local cur hit idx to allowed machine
-  cur=$(current_state "$sid")
-  hit=$(jq -r --arg on "$on" --arg text "$text" --arg cur "$cur" "$JQ_ALLOWED"'
-    . as $m
-    | [(.triggers // []) | to_entries[] | .value as $t | select($t.on == $on)
-        | select($text | test($t.match))
-        | select(($t.unless // null) == null or ($text | test($t.unless) | not))
-        | select(($t.from // null) == null or ($t.from | index($cur)) != null)]
-    | first // empty
-    | .value.to as $to | [.key, $to, ($m | allowed($cur; $to)), ($m.name // "")] | @tsv' "$(machine_file)" 2>/dev/null)
-  [ -n "$hit" ] || exit 0
-  IFS=$'\t' read -r idx to allowed machine <<<"$hit"
-  [ "$to" = "$cur" ] && exit 0
-  record "$sid" "$cur" "$to" "trigger:$idx" "$(printf '%s' "$text" | head -c 200)" "$allowed" "$machine"
+  load_machine
+  read_path "$SESSION"
+  for ((i = 0; i < ${#T_ON[@]}; i++)); do
+    [ "${T_ON[i]}" = "$on" ] || continue
+    [[ $text =~ ${T_MATCH[i]} ]] || continue
+    if [ -n "${T_UNLESS[i]}" ] && [[ $text =~ ${T_UNLESS[i]} ]]; then continue; fi
+    if [ -n "${T_FROM[i]}" ]; then case "${T_FROM[i]}" in *"|$CUR|"*) ;; *) continue ;; esac; fi
+    [ "${T_TO[i]}" = "$CUR" ] && exit 0
+    allowed "$CUR" "${T_TO[i]}"
+    record "$SESSION" "$CUR" "${T_TO[i]}" "trigger:$i" "${text:0:200}" "$REPLY"
+    exit 0
+  done
   exit 0
 }
 
 session_context() {
-  local f cur ctx
-  f=$(machine_file); cur=$(current_state "$SESSION")
-  ctx=$(jq -r --arg cur "${cur:-none}" --arg asm "$SELF" '
-    "ai-state-machine tracks this session'"'"'s workflow stage (machine: \(.name // "default")). Current stage: \($cur).",
-    "On dev tasks, run `\($asm) set \"<STAGE>\"` whenever the stage changes, starting at the beginning of the task. Skip questions, research and other non-dev work.",
-    "Stages:",
-    (.states[] | "- \(.name): \(.description // "")"),
-    (if (.triggers // []) | length > 0 then
-      "Hooks set these automatically, so don'"'"'t set them yourself when the trigger already happened: \([.triggers[].to] | unique | join(", "))."
-     else empty end),
-    "A disallowed move is refused; pass --force only when the move really happened."
-  ' "$f")
-  jq -n --arg ctx "$ctx" '{hookSpecificOutput: {hookEventName: "SessionStart", additionalContext: $ctx}}'
+  local i ctx autos="" nl=$'\n'
+  load_machine; read_path "$SESSION"
+  ctx="ai-state-machine tracks this session's workflow stage (machine: $M_NAME). Current stage: ${CUR:-none}.${nl}"
+  ctx+="On dev tasks, run \`$SELF set \"<STAGE>\"\` whenever the stage changes, starting at the beginning of the task. Skip questions, research and other non-dev work.${nl}Stages:"
+  for ((i = 0; i < ${#M_STATES[@]}; i++)); do ctx+="${nl}- ${M_STATES[i]}: ${M_DESCS[i]}"; done
+  for ((i = 0; i < ${#T_TO[@]}; i++)); do
+    case "|$autos|" in *"|${T_TO[i]}|"*) ;; *) autos+="${autos:+|}${T_TO[i]}" ;; esac
+  done
+  [ -n "$autos" ] && ctx+="${nl}Hooks set these automatically when their trigger happens, so don't set them yourself then: ${autos//|/, }."
+  ctx+="${nl}A disallowed move is refused; pass --force only when the move really happened."
+  json_escape "$ctx"
+  if [ "$1" = sessionStart ]; then
+    printf '{"additional_context":"%s"}\n' "$REPLY"
+  else
+    printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$REPLY"
+  fi
 }
 
 # ---------------------------------------------------------------- main
-
-command -v jq >/dev/null || die "needs jq"
-command -v sqlite3 >/dev/null || die "needs sqlite3"
 
 sub=${1:-get}; [ $# -gt 0 ] && shift
 args=()
@@ -357,12 +506,12 @@ case "$sub" in
   states) cmd_states ;;
   log) cmd_log "$@" ;;
   render) cmd_render ;;
-  statusline) cmd_statusline ;;
+  statusline) cmd_statusline "$@" ;;
   hook) cmd_hook ;;
   validate) cmd_validate "$@" ;;
   which) cmd_which ;;
   init) cmd_init ;;
   diagram) cmd_diagram ;;
-  -h|--help|help) sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) while IFS= read -r l; do case "$l" in '#!'*) ;; '#'*) l=${l#\#}; echo "${l# }" ;; *) break ;; esac; done < "$SELF" ;;
   *) die "unknown command '$sub' (try asm help)" ;;
 esac
