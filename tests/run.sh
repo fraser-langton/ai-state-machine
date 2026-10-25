@@ -37,7 +37,10 @@ hook "$(ev PostToolUse '"tool_name":"exec_command","tool_input":{"command":["bas
 expect "codex-style array command merge" "MERGED" "$(asm get)"
 
 line=$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" render | sed 's/\x1b\[[0-9;]*m//g')
-expect "render" "✓ PLAN › ✓ DEV › ✓ READY FOR REVIEW › ✓ IN REVIEW › ✓ REVIEW DONE › ✓ DRAFT PR › ✓ PR READY › ✓ MERGING ›  MERGED  › DEPLOYED" "$line"
+expect "render: path in visit order, revisits included" "PLAN › DEV › READY FOR REVIEW › IN REVIEW › REVIEW DONE › READY FOR REVIEW › IN REVIEW › REVIEW DONE › DRAFT PR › PR READY › MERGING ›  MERGED " "$line"
+stages="$ASM_HOME/stages.json"; jq '.statusline = {style: "stages"}' "$here/machine.default.json" > "$stages"
+line=$(printf '{"session_id":"t1"}' | ASM_MACHINE=$stages timeout 60 "$here/bin/asm" render | sed 's/\x1b\[[0-9;]*m//g')
+expect "render: stages style" "✓ PLAN › ✓ DEV › ✓ READY FOR REVIEW › ✓ IN REVIEW › ✓ REVIEW DONE › ✓ DRAFT PR › ✓ PR READY › ✓ MERGING ›  MERGED  › DEPLOYED" "$line"
 
 # Cursor: camelCase events, Shell tool, command in tool_input.
 cur_ev() { printf '{"session_id":"t1","hook_event_name":"%s",%s}' "$1" "$2"; }
@@ -54,15 +57,20 @@ out=$(printf '%s' "$(bash_ev 'ls -la')" | nopath hook 2>&1; echo "rc=$?")
 expect "non-firing hook needs no programs" "rc=0" "$out"
 out=$(printf '%s' "$(ev UserPromptSubmit '"prompt":"hello"')" | nopath hook 2>&1; echo "rc=$?")
 expect "plain prompt needs no programs" "rc=0" "$out"
-out=$(printf '{"session_id":"t1"}' | nopath render 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | head -c 8)
-expect "render needs no programs" "✓ PLAN" "$out"
+out=$(printf '{"session_id":"t1"}' | nopath render 2>&1)
+expect "render needs no programs (same output)" "$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" render)" "$out"
 
 asm reset --reason "new task" >/dev/null; expect "reset" "(none)" "$(asm get)"
 expect "render empty after reset" "" "$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" render)"
 asm set plan >/dev/null; asm set dev --force >/dev/null; asm set "pr ready" --force >/dev/null
 line=$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" render | sed 's/\x1b\[[0-9;]*m//g')
-expect "skipped stages marked" "✓ PLAN › ✓ DEV › ✗ READY FOR REVIEW › ✗ IN REVIEW › ✗ REVIEW DONE › ✗ DRAFT PR ›  PR READY  › MERGING › MERGED › DEPLOYED" "$line"
-expect "history kept" "19" "$(sqlite3 "$ASM_HOME/state.db" 'select count(*) from transitions')"
+expect "forced jump marked ✗" "PLAN › DEV ✗  PR READY " "$line"
+line=$(printf '{"session_id":"t1"}' | ASM_MACHINE=$stages timeout 60 "$here/bin/asm" render | sed 's/\x1b\[[0-9;]*m//g')
+expect "stages style marks skipped" "✓ PLAN › ✓ DEV › ✗ READY FOR REVIEW › ✗ IN REVIEW › ✗ REVIEW DONE › ✗ DRAFT PR ›  PR READY  › MERGING › MERGED › DEPLOYED" "$line"
+for st in "ready for review" "in review" "review done" "ready for review" "in review" "review done" "pr ready" "ready for review" "in review" "review done" "pr ready"; do asm set "$st" --force >/dev/null; done
+line=$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" render | sed 's/\x1b\[[0-9;]*m//g')
+expect "long path folds to +N" "+2 ✗ PR READY › READY FOR REVIEW › IN REVIEW › REVIEW DONE › READY FOR REVIEW › IN REVIEW › REVIEW DONE › PR READY › READY FOR REVIEW › IN REVIEW › REVIEW DONE ›  PR READY " "$line"
+expect "history kept" "30" "$(sqlite3 "$ASM_HOME/state.db" 'select count(*) from transitions')"
 expect "forced moves flagged" "2" "$(sqlite3 "$ASM_HOME/state.db" "select count(*) from transitions where allowed = 0")"
 
 echo 'printf "WRAPPED"' > "$ASM_HOME/wrapped-statusline"
@@ -88,7 +96,7 @@ JSON
 )
 expect "user/default machine used outside the repo" "$here/bin/../machine.default.json" "$(asm which)"
 line=$(printf '{"session_id":"t2","workspace":{"current_dir":"%s"}}' "$repo" | timeout 60 "$here/bin/asm" render | sed 's/\x1b\[[0-9;]*m//g')
-expect "status line uses the session folder's machine" " DOING  › DONE" "${line#*› }"
+expect "status line uses the session folder's machine" " DOING " "$line"
 expect "machine name recorded" "tickets" "$(sqlite3 "$ASM_HOME/state.db" "select machine from transitions where session_id = 't2' order by id desc limit 1")"
 expect "diagram edge with trigger label" "    DOING --> DONE : auto · git commit" "$(cd "$repo" && asm diagram | grep 'DOING --> DONE')"
 mkdir -p "$ASM_HOME/other" && (cd "$ASM_HOME/other" && git init -q && asm init >/dev/null)

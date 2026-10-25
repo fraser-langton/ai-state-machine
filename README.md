@@ -12,19 +12,21 @@ Install ai-state-machine from https://github.com/fraser-langton/ai-state-machine
 
 # ai-state-machine
 
-Know where every AI coding session is in your workflow. You define the states and the allowed moves between them. Hooks move the session automatically when something observable happens, the agent moves it the rest of the way, and a progress line under your status line shows the result:
+Know where every AI coding session is in your workflow. You define the states and the allowed moves between them. Hooks move the session automatically when something observable happens, and the agent moves it the rest of the way. A line under your status line shows the path the session has taken:
 
 ```
 Model: Opus 5.5 | Effort: high | 5h: 42% (1h30m) | 7d: 81% (2d7h) | Cost: $1.23
-✓ PLAN › ✓ DEV › ✗ READY FOR REVIEW › ✗ IN REVIEW › ✓ REVIEW DONE › ▌PR READY▐ › MERGING › MERGED › DEPLOYED
+DEV › READY FOR REVIEW › IN REVIEW › REVIEW DONE › DEV › READY FOR REVIEW › IN REVIEW › REVIEW DONE › ▌PR READY▐
 ```
 
 | Mark | Meaning |
 | --- | --- |
+| each state in its colour | the states in the order the session moved through them, revisits included |
 | highlighted block | the current state |
-| `✓` in the state's colour | visited this session |
-| red `✗` | skipped: never visited, but a later state was reached |
-| dim grey | not reached yet |
+| red `✗` instead of `›` | the next move wasn't an allowed transition, e.g. a skipped step forced with `--force` or caught by a trigger |
+| `+N` at the start | N older moves folded away; the line keeps the last 12 (`statusline.max`) |
+
+Prefer a fixed row of every state? Set `"statusline": {"style": "stages"}`. It shows each state in machine order, with ✓ for visited and red ✗ for skipped.
 
 Every transition is stored permanently, so you can see how work actually flows.
 
@@ -199,6 +201,7 @@ stateDiagram-v2
 | `name` | Recorded on every transition, so you can tell workflows apart in the history. |
 | `states[]` | Display order. `color` is a 256-colour ANSI code, and `description` is what the agent is told the state means. |
 | `transitions` | Each state's allowed next states. `asm set` refuses anything else unless you pass `--force`, and records that move with `allowed = 0`. Leave `transitions` out to allow any move. |
+| `statusline` | Optional. `style` is `path` (default: the moves in order) or `stages` (every state in machine order, ✓ visited, ✗ skipped). `max` is how many moves `path` shows before folding older ones into `+N` (default 12). |
 | `triggers[]` | Automatic moves, first match wins. `on` is `prompt` (what the user typed), `skill` (a skill the agent called) or `command` (a shell command the agent ran). `match` and `unless` are POSIX extended regexes, the flavour bash `[[ =~ ]]` uses: write `[[:space:]]` rather than `\s`, and `([^A-Za-z0-9_-]|$)` for a word end rather than `\b`; `asm validate` rejects one that doesn't compile. `from` limits it to certain current states, and `label` names the edge in the diagram. A trigger always records what happened; if the move isn't an allowed transition it's flagged `allowed = 0`. |
 
 ## CLI
