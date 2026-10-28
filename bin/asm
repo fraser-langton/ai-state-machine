@@ -75,7 +75,8 @@ load_machine() {
       "M_HAS_TRANS=\(if .transitions == null then 0 else 1 end)",
       "M_STYLE=\(.statusline.style // "path" | @sh)",
       "M_MAX=\(.statusline.max // 12)",
-      (.states | arr("M_STATES"; .name), arr("M_COLORS"; .color // 244), arr("M_DESCS"; .description // "")),
+      (.states | arr("M_STATES"; .name), arr("M_COLORS"; .color // 244), arr("M_DESCS"; .description // ""),
+        arr("M_REMIND"; .remind // ""), arr("M_REMIND_ON"; .remind_on // "")),
       ((.transitions // {}) | to_entries | arr("M_TFROM"; .key), arr("M_TTO"; "|" + (.value | join("|")) + "|")),
       ((.triggers // []) | arr("T_ON"; .on), arr("T_MATCH"; .match), arr("T_UNLESS"; .unless // ""),
         arr("T_FROM"; if .from == null then "" else "|" + (.from | join("|")) + "|" end),
@@ -367,8 +368,14 @@ cmd_validate() {
     and ((.triggers // []) | all(.to as $t | ($n | index($t)) != null
           and (.on | IN("prompt", "skill", "command")) and (.match | type == "string")))
     and ((.statusline.style // "path") | IN("path", "stages"))
+    and (.states | all((.remind // "" | type == "string") and (.remind_on // "" | type == "string")))
   ' "$f" >/dev/null || die "$f is invalid: check state names are unique and every transition/trigger names a known state"
   ASM_MACHINE=$f load_machine
+  for ((i = 0; i < ${#M_REMIND_ON[@]}; i++)); do
+    [ -n "${M_REMIND_ON[i]}" ] || continue
+    [[ "" =~ ${M_REMIND_ON[i]} ]]; rc=$?
+    [ "$rc" = 2 ] && die "$f: state ${M_STATES[i]} remind_on is not a valid POSIX extended regex: ${M_REMIND_ON[i]}"
+  done
   for ((i = 0; i < ${#T_MATCH[@]}; i++)); do
     [[ "" =~ ${T_MATCH[i]} ]]; rc=$?
     [ "$rc" = 2 ] && die "$f: trigger $i match is not a valid POSIX extended regex: ${T_MATCH[i]}"
@@ -492,17 +499,37 @@ cmd_hook() {
 
   load_machine
   read_path "$SESSION"
+  local entered=0
   for ((i = 0; i < ${#T_ON[@]}; i++)); do
     [ "${T_ON[i]}" = "$on" ] || continue
     [[ $text =~ ${T_MATCH[i]} ]] || continue
     if [ -n "${T_UNLESS[i]}" ] && [[ $text =~ ${T_UNLESS[i]} ]]; then continue; fi
     if [ -n "${T_FROM[i]}" ]; then case "${T_FROM[i]}" in *"|$CUR|"*) ;; *) continue ;; esac; fi
-    [ "${T_TO[i]}" = "$CUR" ] && exit 0
+    [ "${T_TO[i]}" = "$CUR" ] && break
     allowed "$CUR" "${T_TO[i]}"
     record "$SESSION" "$CUR" "${T_TO[i]}" "trigger:$i" "${text:0:200}" "$REPLY"
-    exit 0
+    CUR=${T_TO[i]}; entered=1
+    break
   done
+  remind "$event" "$on" "$text" "$entered"
   exit 0
+}
+
+# Remind the agent what ends the current stage, from the state's "remind" text: on entering
+# it, on every prompt while in it, and after commands matching its "remind_on" regex.
+# The agent knows when a review is finished; hooks can't see it. Claude and Codex only:
+# Cursor's prompt and tool hooks can't add context.
+remind() {
+  local event=$1 on=$2 text=$3 entered=$4 msg
+  case "$event" in [a-z]*) return ;; esac
+  state_index "$CUR"; [ "$REPLY" -ge 0 ] || return
+  msg=${M_REMIND[REPLY]}; [ -n "$msg" ] || return
+  if [ "$entered" = 0 ] && [ "$on" != prompt ]; then
+    [ -n "${M_REMIND_ON[REPLY]}" ] && [[ $text =~ ${M_REMIND_ON[REPLY]} ]] || return
+  fi
+  msg="ai-state-machine: this session is in stage $CUR. ${msg//\{asm\}/bash \"$SELF\"}"
+  json_escape "$msg"
+  printf '{"hookSpecificOutput":{"hookEventName":"%s","additionalContext":"%s"}}\n' "$event" "$REPLY"
 }
 
 session_context() {

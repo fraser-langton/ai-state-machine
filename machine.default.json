@@ -2,38 +2,169 @@
   "name": "dev-workflow",
   "description": "Plan, build, review locally, open a PR, merge and deploy.",
   "states": [
-    { "name": "PLAN", "color": 141, "description": "Designing or planning, no code yet." },
-    { "name": "DEV", "color": 39, "description": "Building, including UAT checks, hands-on review and writing tests." },
-    { "name": "READY FOR REVIEW", "color": 220, "description": "Development and tests done, waiting for a local review (/code-review, /codex-review, /my-review)." },
-    { "name": "IN REVIEW", "color": 208, "description": "A review is running, or its findings are being fixed." },
-    { "name": "REVIEW DONE", "color": 82, "description": "The review is clean on the current head." },
-    { "name": "DRAFT PR", "color": 250, "description": "A draft PR is open." },
-    { "name": "PR READY", "color": 46, "description": "The PR is marked ready." },
-    { "name": "MERGING", "color": 180, "description": "/merge-when-ready is running: waiting for checks or fixing blockers before it merges." },
-    { "name": "MERGED", "color": 213, "description": "Merged; the prod deploy is running." },
-    { "name": "DEPLOYED", "color": 51, "description": "Deploy finished and prod is verified." }
+    {
+      "name": "PLAN",
+      "color": 141,
+      "description": "Designing or planning, no code yet."
+    },
+    {
+      "name": "DEV",
+      "color": 39,
+      "description": "Building, including UAT checks, hands-on review and writing tests."
+    },
+    {
+      "name": "READY FOR REVIEW",
+      "color": 220,
+      "description": "Development and tests done, waiting for a local review (/code-review, /codex-review, /my-review)."
+    },
+    {
+      "name": "IN REVIEW",
+      "color": 208,
+      "description": "A review is running, or its findings are being fixed.",
+      "remind": "When the review is finished, run `{asm} set \"REVIEW DONE\"` and say so in your reply. Finished means every finding is fixed (fixes committed and pushed) or deliberately left, or the review found nothing to fix. A background review is not finished until its results are back and handled.",
+      "remind_on": "(^|[;&|([:space:]])git (-C [^[:space:]]+ )?(commit|push)([^A-Za-z0-9_-]|$)"
+    },
+    {
+      "name": "REVIEW DONE",
+      "color": 82,
+      "description": "The review is clean on the current head."
+    },
+    {
+      "name": "DRAFT PR",
+      "color": 250,
+      "description": "A draft PR is open."
+    },
+    {
+      "name": "PR READY",
+      "color": 46,
+      "description": "The PR is marked ready."
+    },
+    {
+      "name": "MERGING",
+      "color": 180,
+      "description": "/merge-when-ready is running: waiting for checks or fixing blockers before it merges."
+    },
+    {
+      "name": "MERGED",
+      "color": 213,
+      "description": "Merged; the prod deploy is running.",
+      "remind": "When the prod deploy has finished and you have checked prod, run `{asm} set DEPLOYED` and say so in your reply."
+    },
+    {
+      "name": "DEPLOYED",
+      "color": 51,
+      "description": "Deploy finished and prod is verified."
+    }
   ],
   "transitions": {
-    "PLAN": ["DEV"],
-    "DEV": ["PLAN", "READY FOR REVIEW"],
-    "READY FOR REVIEW": ["DEV", "IN REVIEW"],
-    "IN REVIEW": ["DEV", "READY FOR REVIEW", "REVIEW DONE"],
-    "REVIEW DONE": ["READY FOR REVIEW", "DRAFT PR", "PR READY"],
-    "DRAFT PR": ["DEV", "READY FOR REVIEW", "IN REVIEW", "PR READY"],
-    "PR READY": ["DEV", "READY FOR REVIEW", "IN REVIEW", "DRAFT PR", "MERGING"],
-    "MERGING": ["DEV", "READY FOR REVIEW", "PR READY", "MERGED"],
-    "MERGED": ["DEV", "DEPLOYED"],
-    "DEPLOYED": ["PLAN", "DEV"]
+    "PLAN": [
+      "DEV"
+    ],
+    "DEV": [
+      "PLAN",
+      "READY FOR REVIEW"
+    ],
+    "READY FOR REVIEW": [
+      "DEV",
+      "IN REVIEW"
+    ],
+    "IN REVIEW": [
+      "DEV",
+      "READY FOR REVIEW",
+      "REVIEW DONE"
+    ],
+    "REVIEW DONE": [
+      "READY FOR REVIEW",
+      "DRAFT PR",
+      "PR READY"
+    ],
+    "DRAFT PR": [
+      "DEV",
+      "READY FOR REVIEW",
+      "IN REVIEW",
+      "PR READY"
+    ],
+    "PR READY": [
+      "DEV",
+      "READY FOR REVIEW",
+      "IN REVIEW",
+      "DRAFT PR",
+      "MERGING"
+    ],
+    "MERGING": [
+      "DEV",
+      "READY FOR REVIEW",
+      "PR READY",
+      "MERGED"
+    ],
+    "MERGED": [
+      "DEV",
+      "DEPLOYED"
+    ],
+    "DEPLOYED": [
+      "PLAN",
+      "DEV"
+    ]
   },
   "triggers": [
-    {"label": "/code-review, /codex-review, /my-review", "on": "prompt", "match": "^[[:space:]]*[/$]([a-z0-9-]+:)?(code-review|codex-review|my-review|review)([^A-Za-z0-9_-]|$)", "to": "IN REVIEW"},
-    {"label": "/code-review, /codex-review, /my-review", "on": "skill", "match": "^([a-z0-9-]+:)?(code-review|codex-review|my-review|review)$", "to": "IN REVIEW"},
-    {"label": "/merge-when-ready", "on": "prompt", "match": "^[[:space:]]*[/$]([a-z0-9-]+:)?merge-when-ready([^A-Za-z0-9_-]|$)", "to": "MERGING"},
-    {"label": "/merge-when-ready", "on": "skill", "match": "^([a-z0-9-]+:)?merge-when-ready$", "to": "MERGING"},
-    {"label": "gh pr create --draft", "on": "command", "match": "(^|[;&|([:space:]])gh pr create([[:space:]][^;&|]*)?[[:space:]](--draft|-d)([[:space:]]|$)", "to": "DRAFT PR"},
-    {"label": "gh pr create", "on": "command", "match": "(^|[;&|([:space:]])gh pr create([^A-Za-z0-9_-]|$)", "to": "PR READY"},
-    {"label": "gh pr ready", "on": "command", "match": "(^|[;&|([:space:]])gh pr ready([^A-Za-z0-9_-]|$)", "unless": "gh pr ready[^;&|]*--undo", "to": "PR READY"},
-    {"label": "gh pr merge", "on": "command", "match": "(^|[;&|([:space:]])gh pr merge([^A-Za-z0-9_-]|$)", "unless": "gh pr merge[^;&|]*--(auto|disable-auto)([^A-Za-z0-9_-]|$)", "to": "MERGED"},
-    {"label": "git commit", "on": "command", "match": "(^|[;&|([:space:]])git (-C [^[:space:]]+ )?commit([^A-Za-z0-9_-]|$)", "from": ["REVIEW DONE"], "to": "READY FOR REVIEW"}
+    {
+      "label": "/code-review, /codex-review, /my-review",
+      "on": "prompt",
+      "match": "^[[:space:]]*[/$]([a-z0-9-]+:)?(code-review|codex-review|my-review|review)([^A-Za-z0-9_-]|$)",
+      "to": "IN REVIEW"
+    },
+    {
+      "label": "/code-review, /codex-review, /my-review",
+      "on": "skill",
+      "match": "^([a-z0-9-]+:)?(code-review|codex-review|my-review|review)$",
+      "to": "IN REVIEW"
+    },
+    {
+      "label": "/merge-when-ready",
+      "on": "prompt",
+      "match": "^[[:space:]]*[/$]([a-z0-9-]+:)?merge-when-ready([^A-Za-z0-9_-]|$)",
+      "to": "MERGING"
+    },
+    {
+      "label": "/merge-when-ready",
+      "on": "skill",
+      "match": "^([a-z0-9-]+:)?merge-when-ready$",
+      "to": "MERGING"
+    },
+    {
+      "label": "gh pr create --draft",
+      "on": "command",
+      "match": "(^|[;&|([:space:]])gh pr create([[:space:]][^;&|]*)?[[:space:]](--draft|-d)([[:space:]]|$)",
+      "to": "DRAFT PR"
+    },
+    {
+      "label": "gh pr create",
+      "on": "command",
+      "match": "(^|[;&|([:space:]])gh pr create([^A-Za-z0-9_-]|$)",
+      "to": "PR READY"
+    },
+    {
+      "label": "gh pr ready",
+      "on": "command",
+      "match": "(^|[;&|([:space:]])gh pr ready([^A-Za-z0-9_-]|$)",
+      "unless": "gh pr ready[^;&|]*--undo",
+      "to": "PR READY"
+    },
+    {
+      "label": "gh pr merge",
+      "on": "command",
+      "match": "(^|[;&|([:space:]])gh pr merge([^A-Za-z0-9_-]|$)",
+      "unless": "gh pr merge[^;&|]*--(auto|disable-auto)([^A-Za-z0-9_-]|$)",
+      "to": "MERGED"
+    },
+    {
+      "label": "git commit",
+      "on": "command",
+      "match": "(^|[;&|([:space:]])git (-C [^[:space:]]+ )?commit([^A-Za-z0-9_-]|$)",
+      "from": [
+        "REVIEW DONE"
+      ],
+      "to": "READY FOR REVIEW"
+    }
   ]
 }

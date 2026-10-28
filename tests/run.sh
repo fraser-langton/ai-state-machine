@@ -8,7 +8,7 @@ unset CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID ASM_MACHINE
 cd "$ASM_HOME"   # outside $HOME, so no real .ai-state-machine/machine.json is found walking up
 fail=0
 asm() { timeout 60 "$here/bin/asm" "$@" </dev/null; }
-hook() { printf '%s' "$1" | timeout 60 "$here/bin/asm" hook; }
+hook() { printf '%s' "$1" | timeout 60 "$here/bin/asm" hook >/dev/null; }
 expect() { # expect <label> <want> <got>
   if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: want [$2] got [$3]"; fail=1; fi
 }
@@ -55,7 +55,7 @@ expect "cursor sessionStart context" "ai-state-machine tracks this session's wor
 nopath() { PATH=/var/empty /bin/bash "$here/bin/asm" "$@"; }
 out=$(printf '%s' "$(bash_ev 'ls -la')" | nopath hook 2>&1; echo "rc=$?")
 expect "non-firing hook needs no programs" "rc=0" "$out"
-out=$(printf '%s' "$(ev UserPromptSubmit '"prompt":"hello"')" | nopath hook 2>&1; echo "rc=$?")
+out=$(printf '%s' "$(ev UserPromptSubmit '"prompt":"hello"')" | nopath hook 2>&1 >/dev/null; echo "rc=$?")
 expect "plain prompt needs no programs" "rc=0" "$out"
 out=$(printf '{"session_id":"t1"}' | nopath render 2>&1)
 expect "render needs no programs (same output)" "$(printf '{"session_id":"t1"}' | timeout 60 "$here/bin/asm" render)" "$out"
@@ -79,6 +79,19 @@ expect "statusline wraps existing" "WRAPPED" "$out"
 
 ctx=$(printf '{"session_id":"t1","hook_event_name":"SessionStart"}' | timeout 60 "$here/bin/asm" hook | jq -r .hookSpecificOutput.additionalContext | head -1)
 expect "SessionStart context" "ai-state-machine tracks this session's workflow stage (machine: dev-workflow). Current stage: PR READY." "$ctx"
+
+# Stage reminders: on entering a stage with "remind", on prompts while in it, and after its remind_on commands.
+reminder() { printf '%s' "$1" | timeout 60 "$here/bin/asm" hook | jq -r '.hookSpecificOutput.additionalContext // empty'; }
+asm set "ready for review" --force >/dev/null
+out=$(reminder '{"session_id":"t1","hook_event_name":"UserPromptSubmit","prompt":"/code-review medium"}')
+expect "reminder on entering IN REVIEW" "ai-state-machine: this session is in stage IN REVIEW. When the review is finished, run \`bash \"$here/bin/asm\" set \"REVIEW DONE\"\`" "${out%% and say so*}"
+expect "reminder on a later prompt" "1" "$(reminder '{"session_id":"t1","hook_event_name":"UserPromptSubmit","prompt":"fix them"}' | grep -c 'REVIEW DONE')"
+expect "reminder after git push" "1" "$(reminder '{"session_id":"t1","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"git push origin x"}}' | grep -c 'REVIEW DONE')"
+expect "no reminder after other commands" "" "$(reminder '{"session_id":"t1","hook_event_name":"PostToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}')"
+expect "no reminder for Cursor prompt hooks" "" "$(printf '{"session_id":"t1","hook_event_name":"beforeSubmitPrompt","prompt":"x"}' | timeout 60 "$here/bin/asm" hook)"
+asm set "review done" >/dev/null
+expect "no reminder in stages without one" "" "$(reminder '{"session_id":"t1","hook_event_name":"UserPromptSubmit","prompt":"next"}')"
+asm set "pr ready" >/dev/null
 
 # Per-repo machines: the nearest .ai-state-machine/machine.json wins over the user's.
 repo="$ASM_HOME/repo"; mkdir -p "$repo/.ai-state-machine" "$repo/src/deep"
